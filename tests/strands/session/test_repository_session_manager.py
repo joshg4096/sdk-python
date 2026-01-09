@@ -595,3 +595,245 @@ def test_fix_broken_tool_use_does_not_affect_normal_conversations(session_manage
 
     # Should remain unchanged
     assert fixed_messages == messages
+
+
+# ============================================================================
+# Deduplicate Tool Results Tests
+# ============================================================================
+
+
+def test_deduplicate_tool_results_removes_duplicate_error_results(session_manager):
+    """Test that duplicate toolResult blocks from interrupted tools are deduplicated.
+
+    This scenario occurs when:
+    1. Tools are interrupted (error toolResult persisted)
+    2. User sends "continue"
+    3. Tools complete successfully (success toolResult persisted)
+
+    The result should only keep the latest (successful) toolResult for each toolUseId.
+    """
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"toolUse": {"toolUseId": "tool-123", "name": "query_logs", "input": {"query": "test"}}},
+                {"toolUse": {"toolUseId": "tool-456", "name": "query_logs", "input": {"query": "test2"}}},
+                {"toolUse": {"toolUseId": "tool-789", "name": "query_logs", "input": {"query": "test3"}}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"toolResult": {"toolUseId": "tool-123", "status": "error", "content": [{"text": "Tool was interrupted."}]}},
+                {"toolResult": {"toolUseId": "tool-456", "status": "error", "content": [{"text": "Tool was interrupted."}]}},
+                {"toolResult": {"toolUseId": "tool-789", "status": "error", "content": [{"text": "Tool was interrupted."}]}},
+            ],
+        },
+        {"role": "user", "content": [{"text": "continue"}]},
+        {
+            "role": "user",
+            "content": [
+                {"toolResult": {"toolUseId": "tool-123", "status": "success", "content": [{"text": "Query result 1"}]}},
+                {"toolResult": {"toolUseId": "tool-789", "status": "success", "content": [{"text": "Query result 3"}]}},
+                {"toolResult": {"toolUseId": "tool-456", "status": "success", "content": [{"text": "Query result 2"}]}},
+            ],
+        },
+    ]
+
+    fixed_messages = session_manager._fix_broken_tool_use(messages)
+
+    # Should have: assistant (toolUse), user (continue), user (toolResults)
+    # The first user message with error toolResults should be removed
+    assert len(fixed_messages) == 3
+
+    # First message should be the assistant with toolUse
+    assert fixed_messages[0]["role"] == "assistant"
+    assert len(fixed_messages[0]["content"]) == 3
+
+    # Second message should be "continue"
+    assert fixed_messages[1]["role"] == "user"
+    assert fixed_messages[1]["content"][0]["text"] == "continue"
+
+    # Third message should have the successful toolResults
+    assert fixed_messages[2]["role"] == "user"
+    assert len(fixed_messages[2]["content"]) == 3
+
+    # All toolResults should be successful
+    for content in fixed_messages[2]["content"]:
+        assert "toolResult" in content
+        assert content["toolResult"]["status"] == "success"
+
+
+def test_deduplicate_tool_results_keeps_single_results_unchanged(session_manager):
+    """Test that single toolResults (no duplicates) are unchanged."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"toolUse": {"toolUseId": "tool-123", "name": "get_weather", "input": {"city": "Seattle"}}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"toolResult": {"toolUseId": "tool-123", "status": "success", "content": [{"text": "Sunny"}]}},
+            ],
+        },
+    ]
+
+    fixed_messages = session_manager._fix_broken_tool_use(messages)
+
+    # Should remain unchanged
+    assert fixed_messages == messages
+
+
+def test_deduplicate_tool_results_handles_partial_duplicates(session_manager):
+    """Test handling when only some toolUseIds have duplicates."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"toolUse": {"toolUseId": "tool-123", "name": "query_logs", "input": {"query": "test"}}},
+                {"toolUse": {"toolUseId": "tool-456", "name": "query_logs", "input": {"query": "test2"}}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                # Only tool-123 has an error result that will be duplicated
+                {"toolResult": {"toolUseId": "tool-123", "status": "error", "content": [{"text": "Tool was interrupted."}]}},
+                # tool-456 completes normally
+                {"toolResult": {"toolUseId": "tool-456", "status": "success", "content": [{"text": "Result 456"}]}},
+            ],
+        },
+        {"role": "user", "content": [{"text": "continue"}]},
+        {
+            "role": "user",
+            "content": [
+                # Only tool-123 retried
+                {"toolResult": {"toolUseId": "tool-123", "status": "success", "content": [{"text": "Result 123"}]}},
+            ],
+        },
+    ]
+
+    fixed_messages = session_manager._fix_broken_tool_use(messages)
+
+    # Should have 4 messages but first user message should only have tool-456 result
+    assert len(fixed_messages) == 4
+
+    # First user message should only have tool-456 (tool-123 error was deduplicated)
+    assert fixed_messages[1]["role"] == "user"
+    assert len(fixed_messages[1]["content"]) == 1
+    assert fixed_messages[1]["content"][0]["toolResult"]["toolUseId"] == "tool-456"
+
+    # Last user message should have tool-123 success result
+    assert fixed_messages[3]["role"] == "user"
+    assert fixed_messages[3]["content"][0]["toolResult"]["toolUseId"] == "tool-123"
+    assert fixed_messages[3]["content"][0]["toolResult"]["status"] == "success"
+
+
+def test_deduplicate_tool_results_removes_empty_user_messages(session_manager):
+    """Test that user messages emptied by deduplication are removed."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"toolUse": {"toolUseId": "tool-123", "name": "test_tool", "input": {}}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                # This entire message content will be removed as duplicate
+                {"toolResult": {"toolUseId": "tool-123", "status": "error", "content": [{"text": "Error"}]}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                # This is the latest result that will be kept
+                {"toolResult": {"toolUseId": "tool-123", "status": "success", "content": [{"text": "Success"}]}},
+            ],
+        },
+    ]
+
+    fixed_messages = session_manager._fix_broken_tool_use(messages)
+
+    # Should have only 2 messages (assistant + user with success result)
+    # The empty user message should be removed
+    assert len(fixed_messages) == 2
+    assert fixed_messages[0]["role"] == "assistant"
+    assert fixed_messages[1]["role"] == "user"
+    assert fixed_messages[1]["content"][0]["toolResult"]["status"] == "success"
+
+
+def test_deduplicate_tool_results_preserves_message_order(session_manager):
+    """Test that message order is preserved after deduplication."""
+    messages = [
+        {"role": "user", "content": [{"text": "Hello"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"toolUse": {"toolUseId": "tool-123", "name": "test_tool", "input": {}}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"toolResult": {"toolUseId": "tool-123", "status": "error", "content": [{"text": "Error"}]}},
+            ],
+        },
+        {"role": "user", "content": [{"text": "Please retry"}]},
+        {
+            "role": "user",
+            "content": [
+                {"toolResult": {"toolUseId": "tool-123", "status": "success", "content": [{"text": "Done"}]}},
+            ],
+        },
+        {"role": "assistant", "content": [{"text": "Task completed!"}]},
+    ]
+
+    fixed_messages = session_manager._fix_broken_tool_use(messages)
+
+    # First user message with error toolResult should be removed
+    # Other messages should remain in order
+    assert len(fixed_messages) == 5
+    assert fixed_messages[0]["content"][0]["text"] == "Hello"
+    assert "toolUse" in fixed_messages[1]["content"][0]
+    assert fixed_messages[2]["content"][0]["text"] == "Please retry"
+    assert fixed_messages[3]["content"][0]["toolResult"]["status"] == "success"
+    assert fixed_messages[4]["content"][0]["text"] == "Task completed!"
+
+
+def test_deduplicate_tool_results_with_mixed_content(session_manager):
+    """Test deduplication when user messages have mixed content (text + toolResult)."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"toolUse": {"toolUseId": "tool-123", "name": "test_tool", "input": {}}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"text": "Some context"},
+                {"toolResult": {"toolUseId": "tool-123", "status": "error", "content": [{"text": "Error"}]}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"toolResult": {"toolUseId": "tool-123", "status": "success", "content": [{"text": "Success"}]}},
+            ],
+        },
+    ]
+
+    fixed_messages = session_manager._fix_broken_tool_use(messages)
+
+    # Should have 3 messages, first user message should only have text (toolResult removed)
+    assert len(fixed_messages) == 3
+    assert fixed_messages[1]["role"] == "user"
+    assert len(fixed_messages[1]["content"]) == 1
+    assert fixed_messages[1]["content"][0]["text"] == "Some context"
+    assert fixed_messages[2]["content"][0]["toolResult"]["status"] == "success"

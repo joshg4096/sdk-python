@@ -167,12 +167,13 @@ class RepositorySessionManager(SessionManager):
     def _fix_broken_tool_use(self, messages: list[Message]) -> list[Message]:
         """Fix broken tool use/result pairs in message history.
 
-        This method handles two issues:
+        This method handles three issues:
         1. Orphaned toolUse messages without corresponding toolResult.
            Before 1.15.0, strands had a bug where they persisted sessions with a potentially broken messages array.
            This method retroactively fixes that issue by adding a tool_result outside of session management.
            After 1.15.0, this bug is no longer present.
         2. Orphaned toolResult messages without corresponding toolUse (e.g., when pagination truncates messages)
+        3. Duplicate toolResult blocks for the same toolUseId (e.g., when tools are interrupted and retried)
 
         Args:
             messages: The list of messages to fix
@@ -193,7 +194,7 @@ class RepositorySessionManager(SessionManager):
                 )
                 messages.pop(0)
 
-        # Then check for orphaned toolUse messages
+        # Check for orphaned toolUse messages (toolUse without corresponding toolResult)
         for index, message in enumerate(messages):
             # Check all but the latest message in the messages array
             # The latest message being orphaned is handled in the agent class
@@ -226,7 +227,84 @@ class RepositorySessionManager(SessionManager):
                         else:
                             # The message following the toolUse was not a toolResult, so lets insert it
                             messages.insert(index + 1, {"role": "user", "content": missing_content_blocks})
+
+        # Deduplicate toolResult blocks for the same toolUseId.
+        # When tools are interrupted and retried, multiple toolResult blocks may exist
+        # for the same toolUseId. Keep only the latest one (which is typically the successful result).
+        # This must run AFTER the orphaned toolUse fix to avoid re-adding error results.
+        messages = self._deduplicate_tool_results(messages)
+
         return messages
+
+    def _deduplicate_tool_results(self, messages: list[Message]) -> list[Message]:
+        """Deduplicate toolResult blocks that have the same toolUseId.
+
+        When tools are interrupted and retried, the session may contain multiple toolResult
+        blocks for the same toolUseId (e.g., an error result from interruption followed by
+        a success result after retry). This violates Bedrock's constraint that the number of
+        toolResult blocks must match the number of toolUse blocks.
+
+        This method keeps only the latest toolResult for each toolUseId, preferring successful
+        results over error results when they appear later in the conversation.
+
+        Args:
+            messages: The list of messages to deduplicate
+
+        Returns:
+            Messages with duplicate toolResult blocks removed
+        """
+        # Track all toolResult locations: toolUseId -> list of (message_index, content_index)
+        tool_result_locations: dict[str, list[tuple[int, int]]] = {}
+
+        for msg_idx, message in enumerate(messages):
+            if message.get("role") == "user":
+                for content_idx, content in enumerate(message.get("content", [])):
+                    if "toolResult" in content:
+                        tool_use_id = content["toolResult"].get("toolUseId")
+                        if tool_use_id:
+                            if tool_use_id not in tool_result_locations:
+                                tool_result_locations[tool_use_id] = []
+                            tool_result_locations[tool_use_id].append((msg_idx, content_idx))
+
+        # Find duplicates and mark earlier ones for removal
+        # We keep the latest toolResult for each toolUseId
+        content_to_remove: set[tuple[int, int]] = set()
+        for tool_use_id, locations in tool_result_locations.items():
+            if len(locations) > 1:
+                logger.warning(
+                    "tool_use_id=<%s> | Found %d duplicate toolResult blocks for the same toolUseId. "
+                    "This typically happens when tools are interrupted and retried. "
+                    "Keeping only the latest toolResult to maintain valid conversation structure.",
+                    tool_use_id,
+                    len(locations),
+                )
+                # Mark all but the last location for removal
+                for location in locations[:-1]:
+                    content_to_remove.add(location)
+
+        if not content_to_remove:
+            return messages
+
+        # Remove marked content blocks and clean up empty messages
+        result_messages: list[Message] = []
+        for msg_idx, message in enumerate(messages):
+            if message.get("role") == "user":
+                new_content = []
+                for content_idx, content in enumerate(message.get("content", [])):
+                    if (msg_idx, content_idx) not in content_to_remove:
+                        new_content.append(content)
+
+                if new_content:
+                    result_messages.append({"role": message["role"], "content": new_content})
+                else:
+                    logger.debug(
+                        "message_index=<%d> | Removing empty user message after toolResult deduplication",
+                        msg_idx,
+                    )
+            else:
+                result_messages.append(message)
+
+        return result_messages
 
     def sync_multi_agent(self, source: "MultiAgentBase", **kwargs: Any) -> None:
         """Serialize and update the multi-agent state into the session repository.
